@@ -18,9 +18,11 @@ const float LATITUDE  = 51.5074;  // London
 const float LONGITUDE = -0.1278;
 
 // ── NTP ───────────────────────────────────────────────────
+// Using POSIX timezone string for correct automatic BST/GMT switching.
+// FIX: Previously used hardcoded DST_OFFSET_SEC=3600 which caused a
+// permanent -60 min offset. This approach handles transitions correctly.
 const char* NTP_SERVER   = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = 0;     // UTC
-const int   DST_OFFSET_SEC = 3600;  // UK daylight saving
+const char* POSIX_TZ_STR = "GMT0BST,M3.5.0/1,M10.5.0";
 
 // ── Pins ──────────────────────────────────────────────────
 const int PIN_KEY0  = 2;  // toggle battery label
@@ -34,22 +36,22 @@ const unsigned long WEATHER_INTERVAL_MS = 15UL * 60 * 1000;
 const unsigned long CLOCK_INTERVAL_MS   = 60 * 1000;
 const int PARTIAL_LIMIT = 5;
 
-// ── State ─────────────────────────────────────────────────
-bool ledState     = false;
-bool bikeCharging = false;
-unsigned long lastWeatherMs = 0;
-unsigned long lastClockMs   = 0;
-int partialCount = 0;
+// ── RTC memory — survives deep sleep ──────────────────────
+RTC_DATA_ATTR bool  bikeCharging = false;
+RTC_DATA_ATTR int   wakeCount    = 0;
+RTC_DATA_ATTR bool  firstBoot    = true;
 
-String weatherDesc = "---";
-float tempC      = 0;
-float feelsLikeC = 0;
-String rainWindow = "No rain today";
+// Weather cached in RTC so the screen can redraw without a fetch on every wake
+RTC_DATA_ATTR char  rtcWeatherDesc[32] = "---";
+RTC_DATA_ATTR float rtcTempC           = 0;
+RTC_DATA_ATTR float rtcFeelsLikeC      = 0;
+RTC_DATA_ATTR char  rtcRainWindow[48]  = "No rain today";
 
-unsigned long lastKey0Ms = 0;
-unsigned long lastKey1Ms = 0;
-unsigned long lastKey2Ms = 0;
-const unsigned long DEBOUNCE_MS = 50;
+// Working copies used during a wake cycle
+String weatherDesc;
+float  tempC      = 0;
+float  feelsLikeC = 0;
+String rainWindow;
 
 // ── WMO code → description ────────────────────────────────
 String wmoToDesc(int code) {
@@ -183,36 +185,10 @@ void fetchWeather() {
   Serial.println("Rain: " + rainWindow);
 }
 
-// ── Daily 1 liners ────────────────────────────────────────
+// ── Daily inspiration ────────────────────────────────────────
 const char* quotes[] = {
   "Slay! Just Slay!",
-  "You are on fire today",
-  "So freaking hot",
-  "Yes you can",
-  "Giiiiirl, looking fine",
-  "You are my favourite distraction",
-  "Sexy? Me? I'm too shy!",
-  "Looking stunning today",
-  "Drop it like it's hot",
-  "Main character energy only.",
-  "Stop it, you're making the sun jealous.",
-  "Warning: Contents are extremely hot.",
-  "Go get 'em, Tiger.",
-  "Looking like a whole damn snack.",
-  "Queen behavior, honestly.",
-  "The world isn't ready for you today.",
-  "Who gave you permission to be this cute?",
-  "Keep that same energy, you're killing it.",
-  "CEO of looking gorgeous.",
-  "Pure magic, that's what you are.",
-  "Is it hot in here or is it your outfit?",
-  "Manifesting a perfect day for you",
-  "Serving looks, as per usual.",
-  "You're the plot twist I always wanted.",
-  "Absolutely iconic.",
-  "Keep shining, the world needs your glow.",
-  "Me? Obsessed with you?",
-  "Go off, Queen!",
+  "Add your example here"
 };
 const int NUM_QUOTES = sizeof(quotes) / sizeof(quotes[0]);
 
@@ -254,10 +230,13 @@ void drawDisplay(bool fullRefresh) {
   epaper.setCursor(4, 4);
   epaper.print(bikeCharging ? "Battery charging" : "Battery downstairs");
 
-  if (bpc < 20) {
-    epaper.setCursor(4, 24);
-    epaper.print("[LOW BATTERY]");
-  }
+  // ── Battery Status ──
+  char batBuf[6];
+  snprintf(batBuf, sizeof(batBuf), "%d%%", bpc);
+  // Right-align: measure width (each char ~12px wide at textSize 2)
+  int batWidth = strlen(batBuf) * 12;
+  epaper.setCursor(292 - batWidth, 4);
+  epaper.print(batBuf);
 
   epaper.drawLine(0, 26, 296, 26, TFT_BLACK);
 
@@ -286,109 +265,136 @@ void drawDisplay(bool fullRefresh) {
   epaper.setCursor(202, 100);
   epaper.print(now);
 
-  // Partial refresh not yet working — fix in future
-  if (fullRefresh) {
-    epaper.update();
-  } else {
-    epaper.updataPartial(0, 0, 296, 28);
-  }
+  epaper.update()
 #endif
 }
 
-// ── Fix fuzzy gate line at top (not yet working) ──────────
-void fixGateLine() {
-  epaper.writecommand(0x01);
-  epaper.writedata(0x23);
-  epaper.writedata(0x01);
-  epaper.writedata(0x00);
+// ── Go to sleep ───────────────────────────────────────────
+void goToSleep() {
+  Serial.println("Sleeping...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Wake on timer every 60 seconds for clock update
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+
+  // Wake on any button press (EXT1 watches multiple GPIO pins)
+  // Bitmask: GPIO2 = bit 2, GPIO3 = bit 3, GPIO5 = bit 5
+  uint64_t buttonMask = (1ULL << PIN_KEY0) | (1ULL << PIN_KEY1) | (1ULL << PIN_KEY2);
+  esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ALL_LOW);
+
+  Serial.flush();
+  esp_deep_sleep_start();
 }
 
-// ── Setup ─────────────────────────────────────────────────
+// ── Setup — moved everything away from the loop and enabled sleep/wake cycle to preserve battery
 void setup() {
+  setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+  tzset();
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== Door Display booting ===");
+  delay(200);
 
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+  // Load cached weather from RTC into working strings
+  weatherDesc = String(rtcWeatherDesc);
+  tempC       = rtcTempC;
+  feelsLikeC  = rtcFeelsLikeC;
+  rainWindow  = String(rtcRainWindow);
+
+  // ── Determine what this wake needs to do ──────────────────
+  bool doWeatherFetch = false;
+  bool doDebugDump    = false;
+
+  if (firstBoot || cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    firstBoot      = true;
+    doWeatherFetch = true;
+    wakeCount      = 0;
+    Serial.println("\n=== Door Display booting ===");
+
+  } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    uint64_t pinMask = esp_sleep_get_ext1_wakeup_status();
+    Serial.printf("Button wake, mask=0x%llx\n", pinMask);
+
+    if (pinMask & (1ULL << PIN_KEY0)) {
+      bikeCharging = !bikeCharging;
+      Serial.printf("Battery: %s\n", bikeCharging ? "charging" : "downstairs");
+    } else if (pinMask & (1ULL << PIN_KEY1)) {
+      doWeatherFetch = true;
+      wakeCount      = 0;
+    } else if (pinMask & (1ULL << PIN_KEY2)) {
+      doDebugDump = true;
+    }
+
+  } else if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    wakeCount++;
+    Serial.printf("Timer wake #%d\n", wakeCount);
+    if (wakeCount >= WEATHER_EVERY_N_WAKES) {
+      doWeatherFetch = true;
+      wakeCount      = 0;
+    }
+  }
+
+  // ── Initialise display ────────────────────────────────────
   pinMode(PIN_KEY0, INPUT_PULLUP);
   pinMode(PIN_KEY1, INPUT_PULLUP);
   pinMode(PIN_KEY2, INPUT_PULLUP);
 
 #ifdef EPAPER_ENABLE
   epaper.begin();
-  fixGateLine();
   epaper.setRotation(1);
   clearEpaperFull();
-  epaper.update();
-  Serial.printf("Display init: W=%d H=%d\n", epaper.width(), epaper.height());
-  Serial.println("Display OK");
+  if (firstBoot) {
+    epaper.update();  // blank screen on cold boot before drawing
+  }
 #endif
 
-  if (connectWiFi()) {
-    configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
-    Serial.println("Waiting for NTP...");
-    delay(2000);
-    Serial.println("Time: " + getTimeString());
-    fetchWeather();
+  // ── WiFi + NTP + weather if needed ───────────────────────
+  if (doWeatherFetch) {
+    if (connectWiFi()) {
+      if (firstBoot) {
+        configTime(0, 0, NTP_SERVER);
+        setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+        tzset();
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10000)) {
+            Serial.printf("Hour: %d, tm_isdst: %d\n", timeinfo.tm_hour, timeinfo.tm_isdst);
+        }
+
+        Serial.println("Waiting for NTP sync...");
+        // Block up to 10 seconds for a valid NTP time instead of a blind delay
+        if (!getLocalTime(&timeinfo, 10000)) {
+          Serial.println("WARNING: NTP sync failed, time may be wrong!");
+        } else {
+          Serial.println("NTP synced. Time: " + getTimeString());
+        }
+      }
+      fetchWeather();
+      // Reload working strings after fetch updated RTC copies
+      weatherDesc = String(rtcWeatherDesc);
+      tempC       = rtcTempC;
+      feelsLikeC  = rtcFeelsLikeC;
+      rainWindow  = String(rtcRainWindow);
+    }
   }
 
-  drawDisplay(true);
-
-  lastWeatherMs = millis();
-  lastClockMs   = millis();
-  Serial.println("Boot complete");
-}
-
-// ── Loop ──────────────────────────────────────────────────
-void loop() {
-  unsigned long now = millis();
-
-  // KEY0: toggle e-bike battery label
-  if (digitalRead(PIN_KEY0) == LOW && (now - lastKey0Ms) > DEBOUNCE_MS) {
-    lastKey0Ms    = now;
-    bikeCharging  = !bikeCharging;
-    partialCount++;
-    bool doFull = (partialCount >= PARTIAL_LIMIT);
-    if (doFull) partialCount = 0;
-    drawDisplay(true);
-    while (digitalRead(PIN_KEY0) == LOW);
-  }
-
-  // KEY1: force weather refresh
-  if (digitalRead(PIN_KEY1) == LOW && (now - lastKey1Ms) > DEBOUNCE_MS) {
-    lastKey1Ms = now;
-    fetchWeather();
-    lastWeatherMs = now;
-    partialCount  = 0;
-    drawDisplay(true);
-    while (digitalRead(PIN_KEY1) == LOW);
-  }
-
-  // KEY2: serial debug dump
-  if (digitalRead(PIN_KEY2) == LOW && (now - lastKey2Ms) > DEBOUNCE_MS) {
-    lastKey2Ms = now;
-    float bv   = readBatteryVoltage();
+  // ── Debug dump ────────────────────────────────────────────
+  if (doDebugDump) {
+    float bv = readBatteryVoltage();
     Serial.printf("[DBG] Battery: %.2fV (%d%%)\n", bv, batteryPercent(bv));
     Serial.printf("[DBG] Weather: %s %.1fC (feels %.1fC)\n",
                   weatherDesc.c_str(), tempC, feelsLikeC);
     Serial.println("[DBG] Rain: " + rainWindow);
     Serial.println("[DBG] Time: " + getTimeString());
-    while (digitalRead(PIN_KEY2) == LOW);
+    Serial.printf("[DBG] bikeCharging: %s\n", bikeCharging ? "true" : "false");
+    Serial.printf("[DBG] wakeCount: %d / %d\n", wakeCount, WEATHER_EVERY_N_WAKES);
   }
 
-  // Clock tick every minute
-  if (now - lastClockMs >= CLOCK_INTERVAL_MS) {
-    lastClockMs = now;
-    partialCount++;
-    bool doFull = (partialCount >= PARTIAL_LIMIT);
-    if (doFull) partialCount = 0;
-    drawDisplay(doFull);
-  }
-
-  // Weather refresh every 15 minutes
-  if (now - lastWeatherMs >= WEATHER_INTERVAL_MS) {
-    lastWeatherMs = now;
-    fetchWeather();
-    partialCount = 0;
-    drawDisplay(true);
-  }
+  // ── Draw and sleep ────────────────────────────────────────
+  drawDisplay();
+  firstBoot = false;
+  goToSleep();
 }
+
+// loop() is never reached — the device always sleeps at the end of setup()
+void loop() {}
